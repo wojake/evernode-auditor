@@ -2,24 +2,23 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const { EvernodeClient } = require('evernode-js-client');
 const { SqliteDatabase, DataTypes } = require('./lib/sqlite-handler');
+const { BootstrapClient } = require('./bootstrap-client');
 
 // Environment variables.
 const RIPPLED_URL = process.env.RIPPLED_URL || "wss://hooks-testnet.xrpl-labs.com";
-const DATA_DIR = process.env.DATA_DIR || ".";
+const DATA_DIR = process.env.DATA_DIR || __dirname;
 const IS_DEV_MODE = process.env.DEV === "1";
 
 const CONFIG_PATH = DATA_DIR + '/auditor.cfg';
 const DB_PATH = DATA_DIR + '/auditor.sqlite';
-const AUDITOR_CONTRACT_PATH = DATA_DIR + (IS_DEV_MODE ? '/dependencies/default-contract/default-contract.js' : '/auditor-contract');
-const AUDITOR_CLIENT_PATH = DATA_DIR + (IS_DEV_MODE ? '/dependencies/default-client/default-client.js' : '/auditor-client');
-const AUDITOR_CONTRACT_CFG = DATA_DIR + (IS_DEV_MODE ? '/dependencies/contract-template.config' : '/contract-template.config');
+const AUDITOR_CONTRACT_PATH = DATA_DIR + (IS_DEV_MODE ? '/dist/default-contract' : '/auditor-contract');
+const AUDITOR_CLIENT_PATH = DATA_DIR + (IS_DEV_MODE ? '/dist/default-client' : '/auditor-client');
 const DB_TABLE_NAME = 'audit_req';
 const MOMENT_BASE_INDEX = 0;
 const LEDGERS_PER_MOMENT = 72;
 
 // Instance requirement constants.
 const OWNER_PUBKEY = 'ed5cb83404120ac759609819591ef839b7d222c84f1f08b3012f490586159d2b50';
-const INSTANCE_IMAGE = 'hp.latest-ubt.20.04';
 
 const Events = {
     LEDGER: 'ledger'
@@ -36,10 +35,9 @@ const AuditStatus = {
 }
 
 class Auditor {
-    constructor(configPath, dbPath, contractPath, contractCfg, clientPath) {
+    constructor(configPath, dbPath, contractPath, clientPath) {
         this.configPath = configPath;
         this.contractPath = contractPath;
-        this.contractCfg = contractCfg;
         this.auditTable = DB_TABLE_NAME;
 
         if (!fs.existsSync(this.configPath))
@@ -59,7 +57,7 @@ class Auditor {
 
     async init(rippleServer) {
         this.readConfig();
-        if (!this.cfg.xrpl.address || !this.cfg.xrpl.secret || !this.cfg.xrpl.hookAddress)
+        if (!this.cfg.xrpl.address || !this.cfg.xrpl.secret || !this.cfg.xrpl.hookAddress || !this.cfg.instance.image)
             throw "Required cfg fields cannot be empty.";
 
         this.evernodeClient = new EvernodeClient(this.cfg.xrpl.address, this.cfg.xrpl.secret, { hookAddress: this.cfg.xrpl.hookAddress, rippledServer: rippleServer });
@@ -106,25 +104,28 @@ class Auditor {
 
             // Check whether moment is expired while waiting for the response.
             if (!this.checkMomentValidity(momentStartIdx))
-                return;
+                throw 'Moment expired while waiting for the audit response.';
 
             await this.updateAuditCashed(momentStartIdx, hostInfo.currency);
 
             this.logMessage(momentStartIdx, `Redeeming from the host, token - ${hostInfo.currency}`);
+            const startLedger = this.rippleAPI.ledgerVersion;
             const instanceInfo = await this.sendRedeemRequest(hostInfo);
+            // Time took in ledgers for instance redeem.
+            const ledgerTimeTook = this.rippleAPI.ledgerVersion - startLedger;
 
             // Check whether moment is expired while waiting for the redeem.
             if (!this.checkMomentValidity(momentStartIdx))
-                return;
+                throw 'Moment expired while waiting for the redeem response.';
 
             await this.updateAuditStatus(momentStartIdx, AuditStatus.REDEEMED);
 
             this.logMessage(momentStartIdx, `Auditing the host, token - ${hostInfo.currency}`);
-            const auditRes = await this.auditInstance(momentStartIdx, instanceInfo);
+            const auditRes = await this.auditInstance(instanceInfo, ledgerTimeTook, momentStartIdx);
 
             // Check whether moment is expired while waiting for the audit completion.
             if (!this.checkMomentValidity(momentStartIdx))
-                return;
+                throw 'Moment expired while waiting for the audit checks.';
 
             if (auditRes) {
                 this.logMessage(momentStartIdx, `Audit success, token - ${hostInfo.currency}`);
@@ -137,7 +138,7 @@ class Auditor {
             }
         }
         catch (e) {
-            this.logMessage(momentStartIdx, 'Audit error ', e);
+            this.logMessage(momentStartIdx, 'Audit error - ', e);
             await this.updateAuditStatus(momentStartIdx, AuditStatus.FAILED);
         }
 
@@ -161,30 +162,54 @@ class Auditor {
         return (momentStartIdx == this.curMomentStartIdx);
     }
 
-    async auditInstance(momentStartIdx, instanceInfo) {
-        try {
-            await this.uploadAuditorContract(instanceInfo);
-            console.log(instanceInfo);
-            return (await this.audit(instanceInfo.ip, instanceInfo.user_port));
-        }
-        catch (e) {
-            this.logMessage(momentStartIdx, e);
+    async auditInstance(instanceInfo, ledgerTimeTook, momentStartIdx) {
+        // Redeem audit threshold is take as half the moment size.
+        const redeemThreshold = LEDGERS_PER_MOMENT / 2;
+        if (ledgerTimeTook >= redeemThreshold) {
+            console.error(`Redeem took too long. (Took: ${ledgerTimeTook} Threshold: ${redeemThreshold}) Audit failed`);
             return false;
         }
-    }
+        const client = new BootstrapClient(instanceInfo, this.contractPath);
+        // Checking connection with bootstrap contract succeeds.
+        const connectSuccess = await client.connect();
 
-    async uploadAuditorContract(instanceInfo) {
-        // this.contractPath;
-        // this.contractCfg;
-        // Update the config file with instance data and binary details.
-        // Create the zip contract bundle with contract and updated config.
-        // Then upload to the instance.
-        // Mocking the contract upload process, This will be implemented later.
-        return new Promise(resolve => {
-            setTimeout(() => {
-                resolve();
-            }, 1000);
-        });
+        if (!this.checkMomentValidity(momentStartIdx))
+            throw 'Moment expired while waiting for the host connection.';
+
+        if (!connectSuccess) {
+            console.error('Bootstrap contract connection failed.');
+            return false;
+        }
+
+        // Checking whether the bootstrap contract is alive.
+        const isBootstrapRunning = await client.checkStatus();
+
+        if (!this.checkMomentValidity(momentStartIdx))
+            throw 'Moment expired while waiting for the bootstrap contract status.';
+
+        if (!isBootstrapRunning) {
+            console.error('Bootstrap contract status is not live.');
+            return false;
+        }
+
+        // Checking the file upload to bootstrap contract succeeded.
+        const uploadSuccess = await client.uploadContract();
+
+        if (!this.checkMomentValidity(momentStartIdx))
+            throw 'Moment expired while uploading the contract bundle.';
+
+        if (!uploadSuccess) {
+            console.error('Contract upload failed.');
+            return false;
+        }
+
+        // Run custom auditor contract related logic.
+        const auditLogicSuccess = await this.audit(instanceInfo.ip, instanceInfo.user_port);
+        if (!auditLogicSuccess) {
+            console.error('Custom audit process informed fail status.');
+            return false;
+        }
+        return true;
     }
 
     async sendAuditRequest() {
@@ -281,7 +306,7 @@ class Auditor {
         return {
             owner_pubkey: OWNER_PUBKEY,
             contract_id: uuidv4(),
-            image: INSTANCE_IMAGE,
+            image: this.cfg.instance.image,
             config: {}
         }
     }
@@ -304,7 +329,7 @@ async function main() {
     console.log('Data dir: ' + DATA_DIR);
     console.log('Rippled server: ' + RIPPLED_URL);
 
-    const auditor = new Auditor(CONFIG_PATH, DB_PATH, AUDITOR_CONTRACT_PATH, AUDITOR_CONTRACT_CFG, AUDITOR_CLIENT_PATH);
+    const auditor = new Auditor(CONFIG_PATH, DB_PATH, AUDITOR_CONTRACT_PATH, AUDITOR_CLIENT_PATH);
     await auditor.init(RIPPLED_URL);
 }
 
