@@ -1,7 +1,9 @@
 # Evernode Auditor
 
 ## What's here?
-*In development*
+**DEPRECATED**
+
+> DEPRECATED: Evernode's latest design does not rely on Auditors
 
 A node js version of evernode auditor
 
